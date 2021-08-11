@@ -14,11 +14,11 @@ defmodule EXLA.Defn do
     comps_and_exprs =
       for {name, fun, vars, options} <- tuples do
         expr = fun.(vars)
-        inputs = used_inputs(expr)
-        inputs_and_shapes = aot_shapes(vars, 0, inputs)
+        used_inputs = used_inputs(expr)
+        used_shapes = aot_shapes(vars, 0, used_inputs)
 
-        {computation, _extra} = to_root_computation(name, expr, inputs_and_shapes, options)
-        {{computation, name, length(vars), inputs_and_shapes}, expr}
+        computation = to_root_computation(name, expr, used_shapes, options)
+        {{computation, name, length(vars), used_shapes}, expr}
       end
 
     {comps, exprs} = Enum.unzip(comps_and_exprs)
@@ -62,14 +62,12 @@ defmodule EXLA.Defn do
 
     input_vars = Nx.Defn.Tree.flatten_list([input])
     acc_vars = Nx.Defn.Tree.flatten_list([acc])
-    dynamic = length(input_vars) + length(acc_vars)
-    callback = &to_stream_computation(key, input_vars, acc_vars, &1, &2, compile_options)
+    split_fun = &split_stream(&1, &2, length(input_vars), length(acc_vars))
+    comp_fun = &to_stream_computation(key, input_vars, acc_vars, &1, &2, compile_options)
 
     # The input vars should not be converted to buffers as they come from infeed
     {buffers, outputs, executable} =
-      compile({:stream, key}, vars, fun, compile_options, dynamic, callback)
-
-    buffers = Enum.map(acc_vars, &nx_to_buffer!/1) ++ buffers
+      compile({:stream, key}, vars, fun, compile_options, split_fun, comp_fun)
 
     # TODO: Figure keep on device out and convert buffers to nx
     executable
@@ -78,9 +76,23 @@ defmodule EXLA.Defn do
     # |> buffer_to_nx(outputs)
   end
 
-  defp to_stream_computation(key, input_vars, acc_vars, expr, pos_shapes, options) do
+  defp split_stream(vars, used, input_length, acc_length) do
+    # Remove inputs from used buffers and include all accumulator entries.
+    total = input_length + acc_length
+
+    used =
+      Enum.to_list(input_length..(input_length + acc_length - 1)) ++
+        Enum.drop_while(used, &(&1 < total))
+
+    {Enum.take(vars, input_length), used}
+  end
+
+  defp to_stream_computation(key, input_vars, acc_vars, expr, used_shapes, options) do
     inspected_key = inspect(key)
     builder = EXLA.Builder.new(inspected_key)
+
+    # Drop all accumulator entries from used_shapes as we will handle it separately.
+    used_shapes = Enum.drop(used_shapes, length(acc_vars))
 
     # The stream loop will be a three element tuple:
     #
@@ -93,7 +105,7 @@ defmodule EXLA.Defn do
     acc_shapes = Enum.map(acc_vars, &nx_to_shape/1)
     input_shape = EXLA.Shape.make_tuple_shape(input_shapes)
     acc_shape = EXLA.Shape.make_tuple_shape(acc_shapes)
-    constant_shape = EXLA.Shape.make_tuple_shape(Enum.map(pos_shapes, &elem(&1, 1)))
+    constant_shape = EXLA.Shape.make_tuple_shape(Enum.map(used_shapes, &elem(&1, 1)))
 
     flag_shape = EXLA.Shape.make_shape({:pred, 8}, {})
     token_shape = EXLA.Shape.make_token_shape()
@@ -135,7 +147,7 @@ defmodule EXLA.Defn do
             end)
 
           constant_params =
-            Enum.with_index(pos_shapes, fn {pos, _shape}, index ->
+            Enum.with_index(used_shapes, fn {pos, _shape}, index ->
               {pos, EXLA.Op.get_tuple_element(constant, index)}
             end)
 
@@ -165,7 +177,7 @@ defmodule EXLA.Defn do
       end)
 
     {constant_params, _} =
-      Enum.map_reduce(pos_shapes, counter, fn {_pos, shape}, i ->
+      Enum.map_reduce(used_shapes, counter, fn {_pos, shape}, i ->
         {EXLA.Op.parameter(builder, i, shape, "p#{i}"), i + 1}
       end)
 
@@ -178,12 +190,9 @@ defmodule EXLA.Defn do
         EXLA.Op.tuple(builder, constant_params)
       ])
 
-    computation =
-      EXLA.Op.while(cond, body, init)
-      |> EXLA.Op.get_tuple_element(1)
-      |> EXLA.Builder.build()
-
-    {computation, acc_shapes}
+    EXLA.Op.while(cond, body, init)
+    |> EXLA.Op.get_tuple_element(1)
+    |> EXLA.Builder.build()
   end
 
   @doc false
@@ -191,29 +200,27 @@ defmodule EXLA.Defn do
     {run_options, compile_options} = Keyword.pop(options, :run_options, [])
     callback = &to_root_computation(key, &1, &2, compile_options)
 
-    {buffers, outputs, executable} = compile(key, vars, fun, compile_options, 0, callback)
+    {buffers, outputs, executable} =
+      compile(key, vars, fun, compile_options, fn _, used -> {[], used} end, callback)
 
     executable
     |> EXLA.Executable.run(buffers, run_options)
     |> buffer_to_nx(outputs)
   end
 
-  defp compile(key, vars, fun, options, to_drop, to_computation) do
+  defp compile(key, vars, fun, options, to_split, to_computation) do
     expr_args = for var <- vars, do: nx_to_expr_key!(var)
     expr_key = {key, expr_args}
 
-    {expr, {inputs, outputs}} =
+    {expr, {used_inputs, outputs}} =
       EXLA.LockedCache.run(expr_key, fn ->
         expr = fun.(vars)
         {expr, {used_inputs(expr), outputs(expr)}}
       end)
 
-    # Drop all variables that should not be converted to buffers right now.
-    # This is used by streaming as the input and accumulator are handled separately.
-    {non_buffer, to_buffer} = Enum.split(vars, to_drop)
-    inputs = Enum.drop_while(inputs, &(&1 < to_drop))
-    {buffers, cache_args} = nx_to_buffer(to_buffer, inputs)
-    cache_args = Enum.map(non_buffer, &nx_to_cache_key!/1) ++ cache_args
+    {non_buffers, used_inputs} = to_split.(vars, used_inputs)
+    {buffers, cache_args} = nx_to_buffer(vars, used_inputs)
+    cache_args = Enum.map(non_buffers, &nx_to_cache_key!/1) ++ cache_args
 
     {client_name, options} = Keyword.pop(options, :client, :default)
     cache_key = {key, cache_args, client_name, options}
@@ -221,10 +228,9 @@ defmodule EXLA.Defn do
     {_, executable} =
       EXLA.LockedCache.run(cache_key, fn ->
         shapes = Enum.map(buffers, & &1.shape)
-        # TODO: Not happy with more shapes
-        {computation, more_shapes} = to_computation.(expr || fun.(vars), Enum.zip(inputs, shapes))
+        computation = to_computation.(expr || fun.(vars), Enum.zip(used_inputs, shapes))
         client = EXLA.Client.fetch!(client_name)
-        executable = EXLA.Computation.compile(computation, client, more_shapes ++ shapes)
+        executable = EXLA.Computation.compile(computation, client, shapes)
         :persistent_term.put(cache_key, executable)
         {nil, executable}
       end)
@@ -256,11 +262,11 @@ defmodule EXLA.Defn do
   defp outputs(map) when is_map(map),
     do: {:map, map |> Enum.sort() |> Enum.map(fn {k, v} -> {k, outputs(v)} end)}
 
-  defp to_root_computation(key, expr, pos_shapes, options) do
+  defp to_root_computation(key, expr, used_shapes, options) do
     builder = EXLA.Builder.new(inspect(key))
 
     params =
-      Enum.with_index(pos_shapes, fn {pos, shape}, i ->
+      Enum.with_index(used_shapes, fn {pos, shape}, i ->
         {pos, EXLA.Op.parameter(builder, i, shape, "p#{i}")}
       end)
 
@@ -270,13 +276,10 @@ defmodule EXLA.Defn do
       params: Map.new(params)
     }
 
-    computation =
-      expr
-      |> recur_flatten(state, %{})
-      |> elem(0)
-      |> EXLA.Builder.build()
-
-    {computation, []}
+    expr
+    |> recur_flatten(state, %{})
+    |> elem(0)
+    |> EXLA.Builder.build()
   end
 
   defp recur_flatten(composite, state, cache) do
