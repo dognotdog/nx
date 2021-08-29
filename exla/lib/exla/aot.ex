@@ -140,7 +140,7 @@ defmodule EXLA.AOT do
   end
 
   defp compile_function({%Computation{output_shape: out_shape} = comp, name, arity, args}, config) do
-    %EXLA.Shape{dtype: {:t, shapes}} = out_shape
+    %EXLA.Shape{dtype: {:tuple, shapes}} = out_shape
 
     sizes =
       Enum.map(shapes, fn shape ->
