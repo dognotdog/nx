@@ -381,7 +381,7 @@ defmodule Nx.LinAlg do
   def triangular_solve(a, b, opts \\ []) do
     opts = keyword!(opts, lower: true, left_side: true, transform_a: :none)
     output_type = binary_type(a, b) |> Nx.Type.to_floating()
-    %T{shape: a_shape = {m, _}} = a = Nx.to_tensor(a)
+    %T{shape: a_shape = {n, _}} = a = Nx.to_tensor(a)
     %T{shape: b_shape} = b = Nx.to_tensor(b)
 
     case opts[:transform_a] do
@@ -398,7 +398,7 @@ defmodule Nx.LinAlg do
     end
 
     case a_shape do
-      {n, n} ->
+      {^n, ^n} ->
         nil
 
       other ->
@@ -406,14 +406,14 @@ defmodule Nx.LinAlg do
     end
 
     case b_shape do
-      {^m, ^m} ->
+      {^n, _m} ->
         nil
 
-      {^m} ->
+      {^n} ->
         nil
 
       _ ->
-        raise ArgumentError, "incompatible dimensions for a and b on triangular solve"
+        raise ArgumentError, "incompatible dimensions for a and b on triangular solve with a: #{inspect(a_shape)}, b: #{inspect(b_shape)}"
     end
 
     impl!(a, b).triangular_solve(%{b | type: output_type}, a, b, opts)
