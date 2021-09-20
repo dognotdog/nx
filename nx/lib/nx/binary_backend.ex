@@ -1204,7 +1204,7 @@ defmodule Nx.BinaryBackend do
         %{type: b_type, shape: b_shape} = b,
         opts
       )
-      when b_shape == {rows, rows} or b_shape == {rows} do
+      when b_shape == {rows, _cols} or b_shape == {rows} do
     a_data = to_binary(a)
     b_data = to_binary(b)
     out_bin = B.Matrix.ts(a_data, a_type, b_data, b_type, b_shape, output_type, opts)
