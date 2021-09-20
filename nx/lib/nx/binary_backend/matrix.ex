@@ -28,7 +28,7 @@ defmodule Nx.BinaryBackend.Matrix do
 
     b_matrix_or_vec =
       case shape do
-        {rows, rows} ->
+        {_rows, _cols} ->
           b_data |> binary_to_matrix(b_type, shape) |> ts_handle_opts(opts, :b)
 
         {_rows} ->
